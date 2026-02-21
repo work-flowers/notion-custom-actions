@@ -133,7 +133,10 @@ export async function getNotionPageMarkdown({ pageId }: { pageId: string }): Pro
 
           if (dataRows.length > 0) {
             const actualColCount = dataRows[0].length;
-            chunks.push({ type: 'table_rows', rows: dataRows, colCount: actualColCount });
+            const hasRowHeader = !!blockData?.has_row_header;
+            const hasColumnHeader = !!blockData?.has_column_header;
+            console.log(`[table] block.id=${block.id}, table_width=${blockData?.table_width}, has_row_header=${blockData?.has_row_header}, has_column_header=${blockData?.has_column_header}, rows=${dataRows.length}, colCount=${actualColCount}`);
+            chunks.push({ type: 'table_rows', rows: dataRows, colCount: actualColCount, hasRowHeader, hasColumnHeader });
           }
           break;
         }
@@ -162,44 +165,116 @@ export async function getNotionPageMarkdown({ pageId }: { pageId: string }): Pro
     return chunks;
   }
 
-  // Merge consecutive table chunks with the same column count into one
-  // markdown table block, then render everything to final markdown.
-  // Tables are rendered as a SINGLE string with \n between rows so that
-  // the final \n\n join doesn't break the table apart.
+  // Merge consecutive table chunks into one markdown table block, then
+  // render everything to final markdown.  Tables are rendered as a SINGLE
+  // string with \n between rows so that the final \n\n join doesn't break
+  // the table apart.
+  //
+  // Merging is aggressive: column counts do NOT need to match. Shorter
+  // rows are padded with empty cells to match the widest table in the run.
+  // Empty-string chunks (from empty Notion paragraphs) between table
+  // chunks are skipped so they don't break the consecutive-table detection.
   function mergeAndRender(chunks: any[]): string[] {
+    // Pre-filter: remove empty-string chunks that sit between two table
+    // chunks, since Notion often inserts empty paragraphs between blocks.
+    const filtered: any[] = [];
+    for (let k = 0; k < chunks.length; k++) {
+      const cur = chunks[k];
+      const isEmptyString = typeof cur === 'string' && cur.trim() === '';
+      if (isEmptyString) {
+        // Look back and forward for adjacent table chunks
+        const prev = filtered.length > 0 ? filtered[filtered.length - 1] : null;
+        const next = k + 1 < chunks.length ? chunks[k + 1] : null;
+        const prevIsTable = prev && typeof prev === 'object' && prev.type === 'table_rows';
+        const nextIsTable = next && typeof next === 'object' && next.type === 'table_rows';
+        if (prevIsTable && nextIsTable) {
+          // Drop this empty chunk — it would break table merging
+          continue;
+        }
+      }
+      filtered.push(cur);
+    }
+
+    // Debug: log chunk types and colCounts so we can verify in Zapier test panel
+    console.log('[mergeAndRender] chunks after filtering:', filtered.map((c, idx) => {
+      if (c && typeof c === 'object' && c.type === 'table_rows') {
+        return `[${idx}] table_rows (colCount=${c.colCount}, rows=${c.rows.length})`;
+      }
+      return `[${idx}] string: "${typeof c === 'string' ? c.substring(0, 40) : String(c)}"`;
+    }));
+
     const output: string[] = [];
     let i = 0;
 
-    while (i < chunks.length) {
-      const chunk = chunks[i];
+    while (i < filtered.length) {
+      const chunk = filtered[i];
 
       if (chunk && typeof chunk === 'object' && chunk.type === 'table_rows') {
-        // Collect consecutive table chunks with the same column count
-        const mergedRows: string[][] = [...chunk.rows];
-        const colCount = chunk.colCount;
+        // Collect ALL consecutive table chunks regardless of column count
+        const tableGroup: Array<{ rows: string[][]; colCount: number; hasRowHeader: boolean; hasColumnHeader: boolean }> = [chunk];
         let j = i + 1;
 
         while (
-          j < chunks.length &&
-          chunks[j] &&
-          typeof chunks[j] === 'object' &&
-          chunks[j].type === 'table_rows' &&
-          chunks[j].colCount === colCount
+          j < filtered.length &&
+          filtered[j] &&
+          typeof filtered[j] === 'object' &&
+          filtered[j].type === 'table_rows'
         ) {
-          mergedRows.push(...chunks[j].rows);
+          tableGroup.push(filtered[j]);
           j++;
+        }
+
+        // Find the max column count across all merged tables
+        const maxCols = Math.max(...tableGroup.map(t => t.colCount));
+
+        // Flatten all rows, padding shorter ones with empty cells
+        const mergedRows: string[][] = [];
+        for (const t of tableGroup) {
+          for (const row of t.rows) {
+            if (row.length < maxCols) {
+              mergedRows.push([...row, ...Array(maxCols - row.length).fill('')]);
+            } else {
+              mergedRows.push(row);
+            }
+          }
+        }
+
+        // The first chunk determines header flags for the merged table
+        const hasRowHeader = tableGroup[0].hasRowHeader;
+        const hasColumnHeader = tableGroup[0].hasColumnHeader;
+
+        console.log(`[mergeAndRender] merged ${tableGroup.length} table chunk(s) → ${mergedRows.length} rows, maxCols=${maxCols}, hasRowHeader=${hasRowHeader}, hasColumnHeader=${hasColumnHeader}`);
+
+        // If hasColumnHeader, wrap the first cell of each row in **bold**
+        // (only if it isn't already bold-wrapped)
+        if (hasColumnHeader) {
+          for (const row of mergedRows) {
+            if (row[0] && !row[0].startsWith('**')) {
+              row[0] = `**${row[0]}**`;
+            }
+          }
         }
 
         // Build the entire table as a single string with \n between rows
         const tableLines: string[] = [];
-        for (let rowIdx = 0; rowIdx < mergedRows.length; rowIdx++) {
-          tableLines.push(`| ${mergedRows[rowIdx].join(' | ')} |`);
-          // Always add separator after the first row
-          if (rowIdx === 0) {
-            tableLines.push(`| ${mergedRows[rowIdx].map(() => '---').join(' | ')} |`);
+
+        if (hasRowHeader) {
+          // First row is the header row, followed by separator
+          for (let rowIdx = 0; rowIdx < mergedRows.length; rowIdx++) {
+            tableLines.push(`| ${mergedRows[rowIdx].join(' | ')} |`);
+            if (rowIdx === 0) {
+              tableLines.push(`| ${mergedRows[rowIdx].map(() => '---').join(' | ')} |`);
+            }
+          }
+        } else {
+          // No header row — insert a blank header + separator, then all rows as data
+          tableLines.push(`| ${Array(maxCols).fill(' ').join(' | ')} |`);
+          tableLines.push(`| ${Array(maxCols).fill('---').join(' | ')} |`);
+          for (const row of mergedRows) {
+            tableLines.push(`| ${row.join(' | ')} |`);
           }
         }
-        // Join with single newline — this becomes one chunk in the output
+
         output.push(tableLines.join('\n'));
 
         i = j;
